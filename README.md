@@ -1,12 +1,14 @@
 # HARNESS
 
-A no frills agent harness applying UNIX philosophy.
+> No frills agent harness applying UNIX philosophy.
 
 Harness does not bundle an interactive frontend nor a context backend.\
 It does only one thing:\
 _loop turns until done then exit._
 
 Harness is written in bash, and uses `curl` and `jq` only.
+
+Harness is **feature complete**.
 
 ## Usage
 
@@ -66,10 +68,6 @@ Context:
                         sticky "system" message before "user" prompt.
                         May be specified multiple times.
 
-  -X|--inject-ctx BINARY    Call BINARY and inject context;
-                            See readme section 6.2.
-                            May be specified multiple times.
-
   -I                    Cause -i and -X to be called and updated
                         before each turn.
 
@@ -119,7 +117,7 @@ alias infer='harness -s context.json <<\.'
 then
 
 ```
-$ rob
+$ infer
 > hey!
 > What's 2+2?
 > .
@@ -240,7 +238,21 @@ however - the world also contains stateful clients see next section (6.2)
 
 #### 6.2. Stateful Injection
 
-`status: draft`
+`status: discarded`
+
+**Update** After further consideration, the -X flag has been removed from the scope of this project.
+
+Its only compelling use case would have been MCP integration.\
+That no longer justifies adding stateful injection to Harness: as MCP 2.0 evolves toward a stateless interaction model.\
+Support can instead be provided by a small external `mcp-adapter` script.
+
+More broadly, much of modern agent tool-calling amounts to rebuilding abstractions that Unix processes, pipes, standard I/O, and executable tools have already provided for decades.\
+Harness deliberately does not reproduce that machinery internally when it can be composed externally.
+
+The original proposal is retained below for context.
+
+<details>
+<summary>Original proposal</summary>
 
 Option `-X|--inject-ctx BINARY` runs `BINARY` and injects its output messages & tool sections into the request.
 
@@ -330,6 +342,7 @@ The complexity of this section is due to interfacing with a stateful
 application - harness itself is intentionally stateless.
 
 When in doubt, prefer a trivial scripts or programs (6.1.) over flag `-X`.
+</details>
 
 ## License
 
