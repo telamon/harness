@@ -13,8 +13,10 @@ Harness is written in bash, and uses `curl` and `jq` only.
 Install:
 
 ```bash
-curl -o harness https://raw.githubusercontent.com/telamon/harness/refs/heads/v1.0.0/harness
+curl -o harness https://raw.githubusercontent.com/telamon/harness/refs/tags/v1.0.0/harness
+```
 
+```
 echo "hello" | harness
 Hello, how can i help?
 ```
