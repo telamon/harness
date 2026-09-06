@@ -2,18 +2,27 @@
 
 A no frills agent harness applying UNIX philosophy.
 
-Harness does not bundle an interactive frontend nor a context backend.
-It does only one thing: _loop turns until done then exit._
+Harness does not bundle an interactive frontend nor a context backend.\
+It does only one thing:\
+_loop turns until done then exit._
 
 Harness is written in bash, and uses `curl` and `jq` only.
 
 ## Usage
 
-```bash
-$ echo "hello" | harness
-Hello, how can i help?
+Install:
 
-$ harness -h
+```bash
+curl -o harness https://raw.githubusercontent.com/telamon/harness/refs/heads/v1.0.0/harness
+
+echo "hello" | harness
+Hello, how can i help?
+```
+
+Helptext:
+
+```bash
+harness -h
 usage: harness [OPTIONS] < INPUT
 
 Output:
