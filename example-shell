@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# export MODEL_NAME="glm-5.3-flash:cloud"
+# export MODEL_URL="http://127.0.0.1:11434/api/chat"
+
+alias infer='./color_streams harness -vv -s .context.json <<\.'
+
+system_prompt() {
+  cat <<END
+# System
+
+## status
+Current date: $(date)
+Context size: $(du -sh context.json || true)
+
+## instructions
+
+- prefer *nix terminal commands to fullfill user instructions.
+
+END
+}
+
+alias infer='./extras/color harness \
+  -vvI \
+  -s context.json \
+  -i system_prompt \
+  <<\.'

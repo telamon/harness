@@ -1,0 +1,87 @@
+#!/bin/bash
+set -euo pipefail
+
+case "${1:-}" in
+  --stdout)
+    stream_color=35
+    shift
+    ;;
+  --stderr)
+    stream_color=90
+    shift
+    ;;
+  *)
+    [ "$#" -gt 0 ] || {
+      printf 'usage: color COMMAND [ARG...]\n' >&2
+      exit 2
+    }
+    exec perl -e '
+      use strict;
+      use warnings;
+      use IO::Select;
+
+      sub write_all {
+        my ($fh, $data) = @_;
+        while (length $data) {
+          my $written = syswrite($fh, $data);
+          die "write failed: $!\n" unless defined $written;
+          substr($data, 0, $written, "");
+        }
+      }
+
+      pipe(my $stdout_r, my $stdout_w) or die "pipe: $!\n";
+      pipe(my $stderr_r, my $stderr_w) or die "pipe: $!\n";
+      my $pid = fork();
+      die "fork: $!\n" unless defined $pid;
+
+      if ($pid == 0) {
+        close $stdout_r;
+        close $stderr_r;
+        open(STDOUT, ">&", $stdout_w) or die "stdout: $!\n";
+        open(STDERR, ">&", $stderr_w) or die "stderr: $!\n";
+        exec @ARGV or die "exec: $!\n";
+      }
+
+      close $stdout_w;
+      close $stderr_w;
+      my $select = IO::Select->new($stdout_r, $stderr_r);
+      my %color = (fileno($stdout_r) => 35, fileno($stderr_r) => 90);
+      my $colorize = -t STDOUT;
+
+      while (my @ready = $select->can_read) {
+        for my $fh (@ready) {
+          my $buffer = "";
+          my $read = sysread($fh, $buffer, 8192);
+          die "read failed: $!\n" unless defined $read;
+          if ($read == 0) {
+            $select->remove($fh);
+            close $fh;
+            next;
+          }
+          $buffer = "\e[" . $color{fileno($fh)} . "m" . $buffer . "\e[0m"
+            if $colorize;
+          write_all(\*STDOUT, $buffer);
+        }
+      }
+
+      waitpid($pid, 0);
+      my $status = $?;
+      exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
+    ' "$@"
+    ;;
+esac
+
+exec perl -e '
+  use strict;
+  use warnings;
+  my $color = shift;
+  my $colorize = -t STDOUT;
+  while (1) {
+    my $buffer = "";
+    my $read = sysread(STDIN, $buffer, 8192);
+    die "read failed: $!\n" unless defined $read;
+    last if $read == 0;
+    $buffer = "\e[${color}m" . $buffer . "\e[0m" if $colorize;
+    print STDOUT $buffer or die "write failed: $!\n";
+  }
+' "$stream_color"

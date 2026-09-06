@@ -1,0 +1,678 @@
+#!/bin/bash
+set -euo pipefail
+shopt -s lastpipe
+
+MODEL_URL="${MODEL_URL:-http://127.0.0.1:11434/api/chat}"
+MODEL_NAME="${MODEL_NAME:-qwen3.5:2b}"
+HARNESS_REQUESTBIN="${HARNESS_REQUESTBIN:-}"
+MAX_TURNS=50 # 0 = unlimited
+INJECT_BINS=()
+INJECT_MESSAGE_INDEX=()
+INJECT_EACH_TURN=0
+LOAD_CTX_BIN=''
+SAVE_CTX_BIN=''
+TOOL_CALL_BIN=(bash -c)
+TOOL_CONFIRM=0
+TOOLS_DISABLED=0
+VERBOSITY=0
+RAW_PROMPT=0
+RAW_OUTPUT=0
+LINE_BUFFER=0
+CONTEXT_SOURCE=memory
+TURN=0
+INPUT_TOKENS=0
+INPUT_DURATION=0
+OUTPUT_TOKENS=0
+OUTPUT_DURATION=0
+export TURN INPUT_TOKENS INPUT_DURATION OUTPUT_TOKENS OUTPUT_DURATION
+CONTEXT_MESSAGES='[]'
+TURN_ASSISTANT='{}'
+TURN_DONE=0
+TOOL_RESULT='{}'
+BUFFERED_MESSAGE='{}'
+PREVIOUS_ROLETYPE=''
+ROLETYPE_BOUNDARY=0
+TOOLS_BUILTIN=$(cat <<'END'
+{
+  "type": "function",
+  "function": {
+    "name": "exec_command",
+    "description": "Run a terminal command, use it to inspect files or call available tools",
+    "parameters": {
+      "type": "object",
+      "properties": { "command": { "type": "string" } },
+      "required": ["command"]
+    }
+  }
+}
+END
+)
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+set_context_source() {
+  local source=$1 bin=${2:-}
+
+  if [ "$CONTEXT_SOURCE" != memory ]; then
+    die "context source already set: $CONTEXT_SOURCE"
+  fi
+  if [ "$source" = raw ] && { ((${#INJECT_BINS[@]})) || ((INJECT_EACH_TURN)) || ((RAW_PROMPT)); }; then
+    die "-R cannot be combined with -P, -i, or -I"
+  fi
+  CONTEXT_SOURCE=$source
+  LOAD_CTX_BIN=$bin
+}
+
+set_inject_bin() {
+  [ "$CONTEXT_SOURCE" != raw ] || die "-R cannot be combined with -i"
+  INJECT_BINS+=("$1")
+}
+
+set_inject_each() {
+  [ "$CONTEXT_SOURCE" != raw ] || die "-R cannot be combined with -I"
+  INJECT_EACH_TURN=1
+}
+
+set_raw_prompt() {
+  [ "$CONTEXT_SOURCE" != raw ] || die "-R cannot be combined with -P"
+  RAW_PROMPT=1
+}
+
+check_dependencies() {
+  if [ -z "${HARNESS_REQUESTBIN}" ]; then
+    command -v curl >/dev/null || die "missing: curl"
+  fi
+  command -v jq >/dev/null || die "missing: jq"
+  command -v cat >/dev/null || die "missing: cat"
+  command -v tee >/dev/null || die "missing: tee"
+}
+
+usage() {
+  cat <<'EOF'
+usage: harness [OPTIONS] < INPUT
+
+Output:
+
+  -v                    Print tool calls & status to STDERR
+  -vv                   Print 'thinking' & 'system' type messages to STDERR
+  -vvv                  Print harness & turn lifecycle events to STDERR
+
+  -r|--raw-output       Prints all messages to STDOUT as line-delimited JSON.
+                        Messages from -v are rerouted to STDOUT
+
+  -l                    Buffer -r messages until a different role is encountered
+
+Control:
+
+  -q                    Confirm before each tool call
+  -T                    Disable all tool calls
+  -m|--max-turns 50     Limit maximum turns, 0 = unlimited
+
+  -u|--url URL          Same as MODEL_URL
+  -n|--model MODEL      Same as MODEL_NAME
+
+  -W|--tool-bin BINARY  Run BINARY on tool-call, default: `bash -c COMMAND`
+
+  -U|--request-bin BINARY   Use BINARY instead of built-in
+                            curl command
+
+Context:
+
+  -s|--session FILE     Load FILE at turn start; save context at turn end.
+                        (Same as: -b "cat FILE" -e "cat > FILE")
+
+  -b|--load-ctx BINARY  Replace context with BINARY stdout at turn start,
+                        before injection and prompt.
+
+  -e|--save-ctx BINARY  Send current context to BINARY STDIN at turn end.
+
+  -i|--inject BINARY    Call BINARY and insert output as a
+                        sticky "system" message before "user" prompt.
+                        May be specified multiple times.
+
+  -I                    Cause -i to be called and updated
+                        before each turn.
+
+   Note: A failing BINARY terminates harness.
+
+Input:
+
+  All prompt input is read from stdin.
+
+  -P|--raw-prompt       Treat stdin as JSON-array containing
+                        messages in form of:
+                        `{ role: "foo", content:"bar" }`
+
+  -R|--raw-input        Treat input as a fully assembled JSON context.
+                        Cannot be combined with -P, -b, -s, -i or -I.
+
+Environment variables:
+
+    MODEL_URL="http://127.0.0.1:11434/api/chat"
+    MODEL_NAME="qwen3.5:2b"
+
+    Additionally -b and -e receive these variables,
+    metrics are zero before the first model response:
+
+    TURN=integer
+    INPUT_TOKENS=integer
+    INPUT_DURATION=int_nanos
+    OUTPUT_TOKENS=integer
+    OUTPUT_DURATION=int_nanos
+EOF
+}
+
+parse_args() {
+  local -a args=()
+  local a
+  while (($#)); do
+    a=$1; shift
+    case "$a" in
+      --help)      args+=(-h) ;;
+      --ask)       args+=(-q) ;;
+      --raw-input) args+=(-R) ;;
+      --raw-output) args+=(-r) ;;
+      --raw-prompt) args+=(-P) ;;
+      --request-bin) args+=(-U) ;;
+      --request-bin=*) args+=("-U${a#*=}") ;;
+      --tool-bin) args+=(-W) ;;
+      --tool-bin=*) args+=("-W${a#*=}") ;;
+      --url) args+=(-u) ;;
+      --url=*) args+=("-u${a#*=}") ;;
+      --model) args+=(-n) ;;
+      --model=*) args+=("-n${a#*=}") ;;
+      --inject) args+=(-i) ;;
+      --inject=*) args+=("-i${a#*=}") ;;
+      --load-ctx) args+=(-b) ;;
+      --load-ctx=*) args+=("-b${a#*=}") ;;
+      --save-ctx) args+=(-e) ;;
+      --save-ctx=*) args+=("-e${a#*=}") ;;
+      --session)   args+=(-s) ;;
+      --session=*)   args+=("-s${a#*=}") ;;
+      --max-turns)   args+=(-m) ;;
+      --max-turns=*) args+=("-m${a#*=}") ;;
+      --*)           die "unsupported flag: $a" ;;
+      *)             args+=("$a") ;;
+    esac
+  done
+  set -- ${args[@]+"${args[@]}"}
+
+  local OPTIND=1 opt
+  while getopts ":hb:e:i:Ilm:n:vqTrRPs:u:U:W:" opt; do
+    case "$opt" in
+      v)  ((VERBOSITY += 1)) ;;
+      q)  TOOL_CONFIRM=1 ;;
+      T)  TOOLS_DISABLED=1 ;;
+      R)  set_context_source raw ;;
+      P)  set_raw_prompt ;;
+      r)  RAW_OUTPUT=1 ;;
+      l)  LINE_BUFFER=1 ;;
+      h)  usage; exit 0 ;;
+      b)  set_context_source hook "$OPTARG" ;;
+      e)  SAVE_CTX_BIN=$OPTARG ;;
+      i)  set_inject_bin "$OPTARG" ;;
+      I)  set_inject_each ;;
+      s)  local session_q
+          printf -v session_q '%q' "$OPTARG"
+          set_context_source hook "cat $session_q"
+          SAVE_CTX_BIN="cat > $session_q" ;;
+      u)  MODEL_URL=$OPTARG ;;
+      n)  MODEL_NAME=$OPTARG ;;
+      U)  HARNESS_REQUESTBIN=$OPTARG ;;
+      W)  TOOL_CALL_BIN=("$OPTARG") ;;
+      m)  [[ $OPTARG =~ ^[0-9]+$ ]] || die "-m requires a non-negative integer"
+          MAX_TURNS=$OPTARG ;;
+      :)  die "-$OPTARG requires an argument" ;;
+      \?) die "unsupported flag: -$OPTARG" ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+  [ "$#" -eq 0 ] || die "unsupported argument: $1"
+
+  if ((LINE_BUFFER && ! RAW_OUTPUT)); then
+    die "-l requires -r"
+  fi
+  if ((INJECT_EACH_TURN)) && ((${#INJECT_BINS[@]} == 0)); then
+    die "-I requires -i"
+  fi
+}
+
+
+stream_req() {
+  if [ -z "$HARNESS_REQUESTBIN" ]; then
+    curl --fail-with-body --silent --show-error --no-buffer \
+      -H 'Content-Type: application/json' \
+      --data-binary @- \
+      "$MODEL_URL"
+  else
+    "$HARNESS_REQUESTBIN" "$MODEL_URL"
+  fi
+}
+
+# jq2 EXPR A B -- run jq over two JSON docs, bound to $a and $b.
+jq2() {
+  local expr=$1
+  { printf '%s\n' "$2"; printf '%s\n' "$3"; } |
+    jq -cs '.[0] as $a | .[1] as $b | '"$expr"
+}
+
+# ctx_append DOC -- append a JSON message to CONTEXT_MESSAGES
+ctx_append() {
+  CONTEXT_MESSAGES=$(jq2 '$a + [$b]' "$CONTEXT_MESSAGES" "$1")
+}
+
+flush_buffered_message() {
+  [ "$BUFFERED_MESSAGE" != '{}' ] || return 0
+  printf '%s\n' "$BUFFERED_MESSAGE"
+  BUFFERED_MESSAGE='{}'
+}
+
+set_output_role() {
+  local role=$1
+
+  ROLETYPE_BOUNDARY=0
+  if [ -n "$PREVIOUS_ROLETYPE" ] && [ "$PREVIOUS_ROLETYPE" != "$role" ]; then
+    if ((RAW_OUTPUT)); then
+      flush_buffered_message
+    else
+      ROLETYPE_BOUNDARY=1
+    fi
+  fi
+
+  PREVIOUS_ROLETYPE=$role
+}
+
+display_out() {
+  local roletype=$1 text=$2
+  set_output_role "$roletype"
+  if ((ROLETYPE_BOUNDARY)); then
+    printf '\n%s' "$text"
+  else
+    printf '%s' "$text"
+  fi
+}
+
+display_err() {
+  local roletype=$1 text=$2
+  set_output_role "$roletype"
+  if ((ROLETYPE_BOUNDARY)); then
+    printf '\n%s' "$text" >&2
+  else
+    printf '%s' "$text" >&2
+  fi
+}
+
+display_raw_message() {
+  local raw=$1 role message
+
+  if (( ! LINE_BUFFER )); then
+    set_output_role "$(jq -r '.message.role // empty' <<<"$raw")"
+    printf '%s\n' "$raw"
+    return
+  fi
+
+  role=$(jq -r '.message.role // empty' <<<"$raw")
+  if [ -z "$role" ]; then
+    flush_buffered_message
+    PREVIOUS_ROLETYPE=''
+    printf '%s\n' "$raw"
+    return
+  fi
+
+  set_output_role "$role"
+
+  message=$(jq -c '.message' <<<"$raw")
+  if [ "$BUFFERED_MESSAGE" = '{}' ]; then
+    BUFFERED_MESSAGE=$message
+  else
+    BUFFERED_MESSAGE=$(jq2 '
+      $a |
+      .thinking = ((.thinking // "") + ($b.thinking // "")) |
+      .content = ((.content // "") + ($b.content // "")) |
+      .tool_calls = ((.tool_calls // []) + ($b.tool_calls // []))
+    ' "$BUFFERED_MESSAGE" "$message")
+  fi
+}
+
+lifecycle_event() {
+  local type=$1 turn=${2:-} text
+
+  ((VERBOSITY >= 3)) || return 0
+
+  if ((RAW_OUTPUT)); then
+    set_output_role harness
+    if [ -n "$turn" ]; then
+      jq -Mcn --arg type "$type" --argjson turn "$turn" \
+        '{role: "harness", type: $type, turn: $turn}'
+    else
+      jq -Mcn --arg type "$type" '{role: "harness", type: $type}'
+    fi
+    return
+  fi
+
+  if [ "$type" = harness_start ]; then
+    text='HARNESS_START'
+  elif [ "$type" = harness_end ]; then
+    text='HARNESS_END'
+  elif [ -n "$turn" ]; then
+    text="HARNESS_${type^^} $turn"
+  else
+    text="HARNESS_${type^^}"
+  fi
+  display_err harness "$text"$'\n'
+}
+
+dispatch() {
+  local response thinking content stream_done
+
+  while IFS= read -r response; do
+    if ((RAW_OUTPUT)); then
+      display_raw_message "$response"
+    fi
+
+    thinking=$(jq -r '.message.thinking // empty' <<<"$response")
+    if ((VERBOSITY >= 2 && ! RAW_OUTPUT)) && [ -n "$thinking" ]; then
+      display_err assistant_thinking "$thinking"
+    fi
+
+    content=$(jq -r '.message.content // empty' <<<"$response")
+    if (( ! RAW_OUTPUT )) && [ -n "$content" ]; then
+      display_out assistant "$content"
+    fi
+
+    TURN_ASSISTANT=$(jq2 '
+      $a |
+      .thinking += ($b.message.thinking // "") |
+      .content += ($b.message.content // "") |
+      .tool_calls += ($b.message.tool_calls // [])
+    ' "$TURN_ASSISTANT" "$response")
+
+    stream_done=$(jq -r '.done // false' <<<"$response")
+
+    if [ "$stream_done" = true ]; then
+      IFS=$'\t' read -r INPUT_TOKENS INPUT_DURATION OUTPUT_TOKENS OUTPUT_DURATION \
+        < <(jq -r '[.prompt_eval_count, .prompt_eval_duration, .eval_count, .eval_duration] | @tsv' \
+          <<<"$response")
+      TURN_DONE=1
+    fi
+  done
+}
+
+tool_exec() {
+  local command=$1
+  local answer output status tool_pid tool_read_fd tool_write_fd notify_fd tool_feedback=0
+  local executable runtime t0
+
+  read -r executable _ <<<"$command"
+
+  if ((RAW_OUTPUT)); then
+    flush_buffered_message
+    exec {notify_fd}>&1
+    if ((VERBOSITY >= 3)); then
+      tool_feedback=1
+    fi
+  else
+    exec {notify_fd}>&2
+    if ((VERBOSITY >= 1 || TOOL_CONFIRM)); then
+      tool_feedback=1
+    fi
+  fi
+
+  if ((tool_feedback)); then
+    if ((RAW_OUTPUT)); then
+      set_output_role harness
+      jq -Mcn --arg command "$command" \
+        '{role: "harness", type: "tool_call", command: $command}'
+    elif ((VERBOSITY >= 3)); then
+      display_err harness "HARNESS_TOOL_CALL $command"$'\n'
+    else
+      display_err harness "\$ $command"$'\n'
+    fi
+  fi
+  if ((TOOL_CONFIRM)); then
+    printf 'Run this tool? [y/N] ' >&2
+    if ! IFS= read -r answer </dev/tty; then
+      die "could not read tool confirmation"
+    fi
+    [ "$answer" = y ] || die "tool execution declined"
+  fi
+
+  t0=$(date +%s%N)
+  coproc TOOL_PROCESS { "${TOOL_CALL_BIN[@]}" "$command" 2>&1; }
+  tool_pid=$TOOL_PROCESS_PID
+  tool_write_fd=${TOOL_PROCESS[1]}
+  exec {tool_read_fd}<&"${TOOL_PROCESS[0]}"
+  exec {tool_write_fd}>&-
+
+  if ((tool_feedback)); then
+    if ((RAW_OUTPUT)); then
+      output=$(tee \
+        >(jq -MRc '{role: "harness", type: "tool_output", text: .}' >&"$notify_fd") \
+        <&"$tool_read_fd"; printf '\001')
+    else
+      if ((VERBOSITY >= 3)); then
+        output=$(tee \
+          >(while IFS= read -r line; do
+              display_err harness "HARNESS_TOOL_OUTPUT $line"$'\n'
+            done) \
+          <&"$tool_read_fd"; printf '\001')
+      else
+        output=$(tee \
+          >(cat >&"$notify_fd") \
+          <&"$tool_read_fd"; printf '\001')
+      fi
+    fi
+  else
+    output=$(cat <&"$tool_read_fd"; printf '\001')
+  fi
+  output=${output%$'\001'}
+
+  if wait "$tool_pid"; then
+    status=0
+  else
+    status=$?
+  fi
+  runtime=$(( ($(date +%s%N) - t0) / 1000000 ))
+
+  if ((tool_feedback)); then
+    if ((RAW_OUTPUT)); then
+      jq -Mcn --argjson status "$status" \
+        '{role: "harness", type: "tool_result", status: $status}'
+    elif ((VERBOSITY >= 3)); then
+      display_err harness "HARNESS_TOOL_RESULT $status"$'\n'
+    else
+      display_err harness "EXIT STATUS: $status"$'\n\n'
+    fi
+  fi
+
+  TOOL_RESULT=$(
+    {
+      printf '%s\n' "$status"
+      printf '%s' "$command" | jq -Rs .
+      printf '%s' "$output" | jq -Rs .
+    } | jq -cs --arg executable "$executable" --argjson runtime "$runtime" '
+        .[0] as $s | .[1] as $c | .[2] as $o |
+        {
+          role: "tool",
+          tool_name: "exec_command",
+          status: $s,
+          executable: $executable,
+          runtime: $runtime,
+          content: ("\n$ " + $c + "\n" + $o +
+            "\nEXIT STATUS: \($s)\n\n")
+        }')
+
+  if ((RAW_OUTPUT)); then
+    set_output_role tool
+    printf '%s\n' "$TOOL_RESULT"
+  fi
+
+  exec {notify_fd}>&-
+  exec {tool_read_fd}<&-
+}
+
+assemble_prompt() {
+  local model tools
+
+  model=$(jq -Rn --arg value "$MODEL_NAME" '$value')
+  if ((TOOLS_DISABLED)); then
+    tools='[]'
+  else
+    tools="[$TOOLS_BUILTIN]"
+  fi
+  cat <<EOF
+{
+  "model": $model,
+  "stream": true,
+  "think": true,
+  "tools": $tools,
+  "messages": $CONTEXT_MESSAGES
+}
+EOF
+}
+
+load_context() {
+  local context
+
+  context=$(bash -c "$LOAD_CTX_BIN") || die "load context failed: $LOAD_CTX_BIN"
+  CONTEXT_MESSAGES=$(jq -ce '
+    if type == "array" then . else error("context must be a JSON array") end
+  ' <<<"$context") || die "could not load context"
+  INJECT_MESSAGE_INDEX=()
+}
+
+append_prompt() {
+  local input msgs
+  if (( ! RAW_PROMPT )); then
+    input=$(jq -Rs .)
+    CONTEXT_MESSAGES=$(jq2 '$a + [{role: "user", content: $b}]' "$CONTEXT_MESSAGES" "$input")
+  else
+    msgs=$(jq -sce '
+      if length == 1 and (.[0] | type) == "array" then .[0] else . end
+    ') || die "could not read raw-prompt from stdin"
+
+    CONTEXT_MESSAGES=$(jq2 '$a + $b' "$CONTEXT_MESSAGES" "$msgs")
+  fi
+}
+
+inject_context() {
+  local i output message index bin
+
+  for i in "${!INJECT_BINS[@]}"; do
+    bin=${INJECT_BINS[$i]}
+    output=$(bash -c "$bin") || die "injection failed: $bin"
+    message=$(jq -Mcn --arg content "$output" '{role: "system", content: $content}')
+    index=${INJECT_MESSAGE_INDEX[$i]:--1}
+    if ((index < 0)); then
+      INJECT_MESSAGE_INDEX[$i]=$(jq 'length' <<<"$CONTEXT_MESSAGES")
+      ctx_append "$message"
+    else
+      CONTEXT_MESSAGES=$(jq -c --argjson index "$index" --argjson message "$message" \
+        '.[$index] = $message' <<<"$CONTEXT_MESSAGES")
+    fi
+
+    if ((RAW_OUTPUT)); then
+      set_output_role system
+      printf '%s\n' "$message"
+    elif ((VERBOSITY >= 2)); then
+      display_err system "$output"
+    fi
+  done
+}
+
+save_context() {
+  [ -n "$SAVE_CTX_BIN" ] || return 0
+  printf '%s\n' "$CONTEXT_MESSAGES" | bash -c "$SAVE_CTX_BIN" ||
+    die "save context failed: $SAVE_CTX_BIN"
+}
+
+do_turn() {
+  TURN_ASSISTANT='{"role":"assistant","thinking":"","content":"","tool_calls":[]}'
+  TURN_DONE=0
+
+  assemble_prompt | stream_req | dispatch
+
+  ((TURN_DONE)) || die "model response ended without a done marker"
+
+  ctx_append "$TURN_ASSISTANT"
+}
+
+turn_end() {
+  lifecycle_event turn_end "$TURN"
+  save_context
+}
+
+call_tools() {
+  local calls i name command
+
+  calls=$(jq '.tool_calls | length' <<<"$TURN_ASSISTANT")
+  for ((i = 0; i < calls; i++)); do
+    name=$(jq -r ".tool_calls[$i].function.name" <<<"$TURN_ASSISTANT")
+    case "$name" in
+      exec_command)
+        command=$(jq -r ".tool_calls[$i].function.arguments.command" <<<"$TURN_ASSISTANT")
+        tool_exec "$command"
+        ;;
+      *)
+        die "unsupported tool: $name"
+        ;;
+    esac
+
+    ctx_append "$TOOL_RESULT"
+  done
+}
+
+loop_model() {
+  local calls
+
+  while :; do
+    if ((MAX_TURNS > 0 && TURN >= MAX_TURNS)); then
+      die "maximum turns reached: $MAX_TURNS"
+    fi
+    ((TURN += 1))
+    lifecycle_event turn_start "$TURN"
+
+    if [ "$CONTEXT_SOURCE" = hook ]; then
+      load_context
+    fi
+    if [ "$CONTEXT_SOURCE" != raw ]; then
+      if ((${#INJECT_BINS[@]})) && ((TURN == 1 || INJECT_EACH_TURN)); then
+        inject_context
+      fi
+      if ((TURN == 1)); then
+        append_prompt
+      fi
+    fi
+
+    do_turn
+
+    calls=$(jq '.tool_calls | length' <<<"$TURN_ASSISTANT")
+    if ((calls == 0 || TOOLS_DISABLED)); then
+      if ((RAW_OUTPUT)); then
+        flush_buffered_message
+      fi
+      turn_end
+      return
+    fi
+
+    call_tools
+    turn_end
+  done
+}
+
+parse_args "$@"
+check_dependencies
+
+if [ "$CONTEXT_SOURCE" = raw ]; then
+  CONTEXT_MESSAGES=$(jq -c .)
+fi
+
+lifecycle_event harness_start
+loop_model
+
+lifecycle_event harness_end
+
+(( RAW_OUTPUT )) || printf '\n'
