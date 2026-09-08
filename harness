@@ -217,7 +217,7 @@ parse_args() {
       I)  set_inject_each ;;
       s)  local session_q
           printf -v session_q '%q' "$OPTARG"
-          set_context_source hook "cat $session_q"
+          set_context_source hook "if [ -e $session_q ]; then [ -f $session_q ] || exit 1; cat $session_q; fi"
           SAVE_CTX_BIN="cat > $session_q" ;;
       u)  MODEL_URL=$OPTARG ;;
       n)  MODEL_NAME=$OPTARG ;;
@@ -538,6 +538,11 @@ load_context() {
   local context
 
   context=$(bash -c "$LOAD_CTX_BIN") || die "load context failed: $LOAD_CTX_BIN"
+  if [ -z "$context" ]; then
+    CONTEXT_MESSAGES='[]'
+    INJECT_MESSAGE_INDEX=()
+    return
+  fi
   CONTEXT_MESSAGES=$(jq -ce '
     if type == "array" then . else error("context must be a JSON array") end
   ' <<<"$context") || die "could not load context"
