@@ -515,9 +515,12 @@ tool_exec() {
 }
 
 assemble_prompt() {
-  local model tools
+  local model tools messages
 
   model=$(jq -Rn --arg value "$MODEL_NAME" '$value')
+  messages=$(jq -c '
+    map(with_entries(select(.key | startswith("_") | not)))
+  ' <<<"$CONTEXT_MESSAGES") || die "could not prepare request context"
   if ((TOOLS_DISABLED)); then
     tools='[]'
   else
@@ -529,7 +532,7 @@ assemble_prompt() {
   "stream": true,
   "think": true,
   "tools": $tools,
-  "messages": $CONTEXT_MESSAGES
+  "messages": $messages
 }
 EOF
 }

@@ -191,6 +191,10 @@ $HARNESS_REQUESTBIN "$MODEL_URL"
 
 (It's the planned escape hatch for api translation.)
 
+Note: harness filters out underscore prefixed properties in context `message`
+and never forwards them on remote requests.
+Custom properties received on `-b` are however returned on `-e`.
+
 `jq` dependency cannot currently be substituted.
 
 `cat` and `tee` are also expected to be present.
