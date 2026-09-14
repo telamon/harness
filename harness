@@ -8,6 +8,7 @@ HARNESS_REQUESTBIN="${HARNESS_REQUESTBIN:-}"
 MAX_TURNS=50 # 0 = unlimited
 INJECT_BINS=()
 INJECT_MESSAGE_INDEX=()
+PROMPT_MESSAGE_INDEX=-1
 INJECT_EACH_TURN=0
 LOAD_CTX_BIN=''
 SAVE_CTX_BIN=''
@@ -131,6 +132,7 @@ Context:
 
   -i|--inject BINARY    Call BINARY and insert output as a
                         sticky "system" message before "user" prompt.
+                        BINARY receives the assembled JSON context on STDIN.
                         May be specified multiple times.
 
   -I                    Cause -i to be called and updated
@@ -550,10 +552,12 @@ load_context() {
     if type == "array" then . else error("context must be a JSON array") end
   ' <<<"$context") || die "could not load context"
   INJECT_MESSAGE_INDEX=()
+  PROMPT_MESSAGE_INDEX=-1
 }
 
 append_prompt() {
   local input msgs
+  PROMPT_MESSAGE_INDEX=$(jq 'length' <<<"$CONTEXT_MESSAGES")
   if (( ! RAW_PROMPT )); then
     input=$(jq -Rs .)
     CONTEXT_MESSAGES=$(jq2 '$a + [{role: "user", content: $b}]' "$CONTEXT_MESSAGES" "$input")
@@ -566,17 +570,32 @@ append_prompt() {
   fi
 }
 
+ctx_insert() {
+  local index=$1 message=$2
+  CONTEXT_MESSAGES=$(jq -c --argjson index "$index" --argjson message "$message" \
+    '.[:$index] + [$message] + .[$index:]' <<<"$CONTEXT_MESSAGES")
+}
+
 inject_context() {
-  local i output message index bin
+  local i output message index bin next_index
+
+  next_index=$PROMPT_MESSAGE_INDEX
 
   for i in "${!INJECT_BINS[@]}"; do
     bin=${INJECT_BINS[$i]}
-    output=$(bash -c "$bin") || die "injection failed: $bin"
+    output=$(bash -c "$bin" <<<"$CONTEXT_MESSAGES") || die "injection failed: $bin"
     message=$(jq -Mcn --arg content "$output" '{role: "system", content: $content}')
     index=${INJECT_MESSAGE_INDEX[$i]:--1}
     if ((index < 0)); then
-      INJECT_MESSAGE_INDEX[$i]=$(jq 'length' <<<"$CONTEXT_MESSAGES")
-      ctx_append "$message"
+      if ((next_index >= 0)); then
+        index=$next_index
+        ((next_index += 1))
+        ctx_insert "$index" "$message"
+      else
+        index=$(jq 'length' <<<"$CONTEXT_MESSAGES")
+        ctx_append "$message"
+      fi
+      INJECT_MESSAGE_INDEX[$i]=$index
     else
       CONTEXT_MESSAGES=$(jq -c --argjson index "$index" --argjson message "$message" \
         '.[$index] = $message' <<<"$CONTEXT_MESSAGES")
@@ -647,11 +666,11 @@ loop_model() {
       load_context
     fi
     if [ "$CONTEXT_SOURCE" != raw ]; then
-      if ((${#INJECT_BINS[@]})) && ((TURN == 1 || INJECT_EACH_TURN)); then
-        inject_context
-      fi
       if ((TURN == 1)); then
         append_prompt
+      fi
+      if ((${#INJECT_BINS[@]})) && ((TURN == 1 || INJECT_EACH_TURN)); then
+        inject_context
       fi
     fi
 

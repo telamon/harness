@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Translate Harness's Ollama stream to mistral.rs's OpenAI-compatible stream.
+
+set -euo pipefail
+
+endpoint=$1
+request=$(jq -c '
+  del(.think)
+  | .messages |= (
+      reduce .[] as $message (
+        {pending_calls: [], messages: []};
+        if $message.role == "assistant" then
+          ($message.tool_calls // []) as $calls
+          | .pending_calls = ($calls | map(.id))
+          | .messages += [
+              {role: "assistant", content: ($message.content // "")}
+              + if $calls == [] then {} else {
+                  tool_calls: ($calls | map(
+                    .function.arguments |= if type == "string" then . else tojson end
+                  ))
+                } end
+            ]
+        elif $message.role == "tool" then
+          .pending_calls[0] as $tool_call_id
+          | .pending_calls |= .[1:]
+          | .messages += [{
+              role: "tool",
+              tool_call_id: $tool_call_id,
+              content: $message.content
+            }]
+        else
+          .messages += [$message | {role, content}]
+        end
+      )
+      | .messages
+    )
+' < /dev/stdin)
+model=$(jq -r '.model' <<<"$request")
+
+declare -a tool_id tool_name tool_arguments
+input_tokens=0
+output_tokens=0
+
+emit_tool_calls() {
+  local index call calls='[]'
+
+  for index in "${!tool_name[@]}"; do
+    call=$(jq -cn \
+      --arg id "${tool_id[$index]}" \
+      --arg name "${tool_name[$index]}" \
+      --arg arguments "${tool_arguments[$index]}" \
+      '{id: $id, type: "function", function: {name: $name, arguments: ($arguments | fromjson)}}')
+    calls=$(jq -c --argjson call "$call" '. + [$call]' <<<"$calls")
+  done
+
+  [ "$calls" = '[]' ] && return
+  jq -cn --argjson calls "$calls" \
+    '{message: {role: "assistant", content: "", tool_calls: $calls}, done: false}'
+}
+
+emit_done() {
+  jq -cn \
+    --arg model "$model" \
+    --argjson input_tokens "$input_tokens" \
+    --argjson output_tokens "$output_tokens" \
+    '{
+      model: $model,
+      message: {role: "assistant", content: ""},
+      done: true,
+      prompt_eval_count: $input_tokens,
+      prompt_eval_duration: 0,
+      eval_count: $output_tokens,
+      eval_duration: 0
+    }'
+}
+
+handle_frame() {
+  local frame=$1 content thinking index id name arguments
+
+  if [ "$frame" = '[DONE]' ]; then
+    emit_tool_calls
+    emit_done
+    return
+  fi
+
+  input_tokens=$(jq -r '.usage.prompt_tokens // 0' <<<"$frame")
+  output_tokens=$(jq -r '.usage.completion_tokens // 0' <<<"$frame")
+
+  content=$(jq -r '.choices[0].delta.content // empty' <<<"$frame")
+  thinking=$(jq -r '.choices[0].delta.reasoning_content // empty' <<<"$frame")
+  if [ -n "$content" ] || [ -n "$thinking" ]; then
+    jq -cn --arg content "$content" --arg thinking "$thinking" '
+      {message: ({role: "assistant"}
+        + if $content == "" then {} else {content: $content} end
+        + if $thinking == "" then {} else {thinking: $thinking} end), done: false}'
+  fi
+
+  while IFS= read -r index; do
+    id=$(jq -r --argjson index "$index" \
+      '.choices[0].delta.tool_calls[] | select(.index == $index) | .id // empty' <<<"$frame")
+    name=$(jq -r --argjson index "$index" \
+      '.choices[0].delta.tool_calls[] | select(.index == $index) | .function.name // empty' <<<"$frame")
+    arguments=$(jq -r --argjson index "$index" \
+      '.choices[0].delta.tool_calls[] | select(.index == $index) | .function.arguments // empty' <<<"$frame")
+
+    [ -z "$id" ] || tool_id[$index]=$id
+    [ -z "$name" ] || tool_name[$index]=$name
+    tool_arguments[$index]+=$arguments
+  done < <(jq -r '.choices[0].delta.tool_calls[]?.index' <<<"$frame")
+}
+
+curl_args=(
+  --fail-with-body --silent --show-error --no-buffer
+  -H 'Content-Type: application/json'
+  -H 'Accept: text/event-stream'
+)
+if [ -n "${OPENAI_API_KEY:-}" ]; then
+  curl_args+=(-H "Authorization: Bearer $OPENAI_API_KEY")
+fi
+
+printf '%s\n' "$request" |
+  curl "${curl_args[@]}" \
+    --data-binary @- \
+    "$endpoint" |
+  while IFS= read -r line; do
+    case "$line" in
+      'data: '[![:space:]]*) handle_frame "${line#data: }" ;;
+    esac
+  done

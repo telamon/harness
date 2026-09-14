@@ -67,6 +67,7 @@ Context:
 
   -i|--inject BINARY    Call BINARY and insert output as a
                         sticky "system" message before "user" prompt.
+                        BINARY receives the assembled JSON context on STDIN.
                         May be specified multiple times.
 
   -I                    Cause -i and -X to be called and updated
@@ -139,9 +140,41 @@ You asked for 2+2 it's still 4!
 
 ### 1. Format
 
-Harness internally uses the JSON format of Mozilla/ollama.
+Harness internally uses the JSON format of Mozilla/ollama (subject to change).
 It is compatible with other services given that a translation
-script is provided to `--request-bin`
+script is provided to `-U` or `--request-bin`
+
+OpenAI v1 compatible:
+
+```bash
+MODEL_NAME=gpt-5-mini \
+MODEL_URL='https://api.openai.com/v1/chat/completions' \
+OPENAI_API_KEY='...' \
+  harness -U extras/api-open-v1 <<\.
+> Hello
+> .
+```
+
+Anthropic Messages API
+
+```bash
+MODEL_NAME=claude-sonnet-5 \
+MODEL_URL='https://api.anthropic.com/v1/messages' \
+ANTHROPIC_API_KEY='...' \
+  harness -U extras/api-claude <<\.
+> Hello
+> .
+```
+
+Mistralrs local runtime:
+
+```bash
+MODEL_NAME=default \
+MODEL_URL=http://127.0.0.1:1234/v1/chat/completions \
+  harness -U extras/api-open-v1 <<\.
+> Hello
+> .
+```
 
 ### 2. Modularity
 

@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# Translate Harness's Ollama stream to Anthropic Messages API streaming.
+
+set -euo pipefail
+
+endpoint=$1
+max_tokens=${MAX_TOKENS:-8192}
+request=$(jq -c --argjson max_tokens "$max_tokens" '
+  . as $request
+  | reduce .messages[] as $message (
+      {system: [], pending_calls: [], messages: []};
+      if $message.role == "system" then
+        .system += [$message.content]
+      elif $message.role == "assistant" then
+        ($message.tool_calls // []) as $calls
+        | .pending_calls = ($calls | map(.id))
+        | .messages += [{
+            role: "assistant",
+            content: (
+              [if $message.content == "" then empty else {type: "text", text: $message.content} end]
+              + [$calls[] | {
+                  type: "tool_use",
+                  id: .id,
+                  name: .function.name,
+                  input: .function.arguments
+                }]
+            )
+          }]
+      elif $message.role == "tool" then
+        .pending_calls[0] as $tool_use_id
+        | .pending_calls |= .[1:]
+        | .messages += [{
+            role: "user",
+            content: [{
+              type: "tool_result",
+              tool_use_id: $tool_use_id,
+              content: $message.content
+            }]
+          }]
+      else
+        .messages += [$message | {role, content}]
+      end
+    )
+  | {
+      model: $request.model,
+      max_tokens: $max_tokens,
+      stream: true,
+      messages: .messages,
+      tools: ($request.tools | map(.function | {
+        name,
+        description,
+        input_schema: .parameters
+      }))
+    }
+    + if .system == [] then {} else {system: (.system | join("\n\n"))} end
+' < /dev/stdin)
+model=$(jq -r '.model' <<<"$request")
+
+declare -a tool_id tool_name tool_arguments
+input_tokens=0
+output_tokens=0
+
+emit_tool_calls() {
+  local index call calls='[]'
+
+  for index in "${!tool_name[@]}"; do
+    call=$(jq -cn \
+      --arg id "${tool_id[$index]}" \
+      --arg name "${tool_name[$index]}" \
+      --arg arguments "${tool_arguments[$index]}" \
+      '{id: $id, type: "function", function: {name: $name, arguments: ($arguments | fromjson)}}')
+    calls=$(jq -c --argjson call "$call" '. + [$call]' <<<"$calls")
+  done
+
+  [ "$calls" = '[]' ] && return
+  jq -cn --argjson calls "$calls" \
+    '{message: {role: "assistant", content: "", tool_calls: $calls}, done: false}'
+}
+
+emit_done() {
+  jq -cn \
+    --arg model "$model" \
+    --argjson input_tokens "$input_tokens" \
+    --argjson output_tokens "$output_tokens" \
+    '{
+      model: $model,
+      message: {role: "assistant", content: ""},
+      done: true,
+      prompt_eval_count: $input_tokens,
+      prompt_eval_duration: 0,
+      eval_count: $output_tokens,
+      eval_duration: 0
+    }'
+}
+
+handle_event() {
+  local event=$1 data=$2 index type content thinking partial_json
+
+  case "$event" in
+    message_start)
+      input_tokens=$(jq -r '.message.usage.input_tokens // 0' <<<"$data")
+      ;;
+    content_block_start)
+      index=$(jq -r '.index' <<<"$data")
+      type=$(jq -r '.content_block.type' <<<"$data")
+      if [ "$type" = tool_use ]; then
+        tool_id[$index]=$(jq -r '.content_block.id' <<<"$data")
+        tool_name[$index]=$(jq -r '.content_block.name' <<<"$data")
+        tool_arguments[$index]=''
+      fi
+      ;;
+    content_block_delta)
+      type=$(jq -r '.delta.type' <<<"$data")
+      case "$type" in
+        text_delta)
+          content=$(jq -r '.delta.text' <<<"$data")
+          jq -cn --arg content "$content" \
+            '{message: {role: "assistant", content: $content}, done: false}'
+          ;;
+        thinking_delta)
+          thinking=$(jq -r '.delta.thinking' <<<"$data")
+          jq -cn --arg thinking "$thinking" \
+            '{message: {role: "assistant", thinking: $thinking}, done: false}'
+          ;;
+        input_json_delta)
+          index=$(jq -r '.index' <<<"$data")
+          partial_json=$(jq -r '.delta.partial_json' <<<"$data")
+          tool_arguments[$index]+=$partial_json
+          ;;
+      esac
+      ;;
+    message_delta)
+      output_tokens=$(jq -r '.usage.output_tokens // 0' <<<"$data")
+      ;;
+    message_stop)
+      emit_tool_calls
+      emit_done
+      ;;
+  esac
+}
+
+curl_args=(
+  --fail-with-body --silent --show-error --no-buffer
+  -H 'Content-Type: application/json'
+  -H 'Accept: text/event-stream'
+  -H 'anthropic-version: 2023-06-01'
+)
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  curl_args+=(-H "x-api-key: $ANTHROPIC_API_KEY")
+fi
+
+printf '%s\n' "$request" |
+  curl "${curl_args[@]}" \
+    --data-binary @- \
+    "$endpoint" |
+  {
+    event=''
+    data=''
+
+    while IFS= read -r line; do
+      case "$line" in
+        'event: '*) event=${line#event: } ;;
+        'data: '*) data+="${line#data: }" ;;
+        '')
+          if [ -n "$event" ] && [ -n "$data" ]; then
+            handle_event "$event" "$data"
+          fi
+          event=''
+          data=''
+          ;;
+      esac
+    done
+  }
