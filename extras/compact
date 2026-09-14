@@ -1,0 +1,57 @@
+#!/bin/bash
+
+MAX_CONTEXT=64000
+
+usage() {
+  cat <<'END'
+usage: compact [--auto MAX_CONTEXT] CONTEXT.json
+
+Generate a compacted Harness JSON context array from CONTEXT.json.
+
+With --auto, return the original context while INPUT_TOKENS is below
+MAX_CONTEXT. INPUT_TOKENS is supplied by Harness from the prior turn.
+
+Use compact as the context loader and save the resulting context normally:
+
+  harness \
+    -b "extras/compact --auto 128000 context.json" \
+    -e "cat > context.json" <<\.
+  > Hello
+  > .
+END
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  --auto)
+    [ "$#" -eq 3 ] || { usage >&2; exit 1; }
+    MAX_CONTEXT=$2
+    CONTEXT_FILE=$3
+    if ((INPUT_TOKENS < MAX_CONTEXT)); then
+      cat "$CONTEXT_FILE"
+      exit 0
+    fi
+    ;;
+  *)
+    [ "$#" -eq 1 ] || { usage >&2; exit 1; }
+    CONTEXT_FILE=$1
+    ;;
+esac
+
+TASK=$(cat <<'END'
+You are generating a continuation prompt for a session. Summarize:
+1. The current task and its status.
+2. Which files are being modified.
+3. Any blockers or dependencies.
+4. The next steps to complete the work.
+END
+)
+
+SUMMARY=$(jq -c --arg task "$TASK" '
+  . + [{role: "user", content: $task}]
+' "$CONTEXT_FILE" | harness -T -R)
+
+jq -cn --arg content "$SUMMARY" '[{role: "system", content: $content}]'
