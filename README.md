@@ -15,7 +15,7 @@ Harness is **feature complete**.
 Install:
 
 ```bash
-curl -o harness https://raw.githubusercontent.com/telamon/harness/refs/tags/v1.0.1/harness
+curl -o harness https://raw.githubusercontent.com/telamon/harness/refs/tags/v1.0.2/harness
 chmod +x harness
 ```
 
